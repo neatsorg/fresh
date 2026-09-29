@@ -148,8 +148,12 @@ pub struct EnumOption {
 /// A category in the settings tree
 #[derive(Debug, Clone)]
 pub struct SettingCategory {
-    /// Category name (e.g., "Editor", "File Explorer")
+    /// Category name (e.g., "Editor", "File Explorer"). Stable across
+    /// locales: the tree's nesting, ordering and icons key on it.
     pub name: String,
+    /// The name shown to the user: `name` translated through
+    /// `settings.category.<slug>`, or `name` itself when there is none.
+    pub display_name: String,
     /// JSON path prefix for this category
     pub path: String,
     /// Description of this category
@@ -334,11 +338,13 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
         // Check if this property should be a standalone category (for Map types)
         if prop.standalone_category {
             // Create a category with the Map setting as its only content
-            let setting = parse_setting(&name, &path, &prop, &defs, &enum_values_map);
+            let setting = parse_setting(&name, &path, &path, &prop, &defs, &enum_values_map);
+            let description = prop.description.clone().or(resolved.description.clone());
             categories.push(SettingCategory {
+                display_name: i18n_category_name(&display_name),
+                description: i18n_category_description(&display_name, description),
                 name: display_name,
                 path: path.clone(),
-                description: prop.description.clone().or(resolved.description.clone()),
                 nullable: is_nullable,
                 settings: vec![setting],
                 subcategories: Vec::new(),
@@ -346,7 +352,7 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
             });
         } else if let Some(ref inner_props) = resolved.properties {
             // This is a category with nested settings.
-            let settings = parse_properties(inner_props, &path, &defs, &enum_values_map);
+            let settings = parse_properties(inner_props, &path, &path, &defs, &enum_values_map);
             // Prefer the field-level doc comment (more specific to how the
             // category is used) over the struct-level one (often generic
             // boilerplate like "Editor configuration"). When both exist they
@@ -357,9 +363,10 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
                 .clone()
                 .or_else(|| resolved.description.clone());
             categories.push(SettingCategory {
+                display_name: i18n_category_name(&display_name),
+                description: i18n_category_description(&display_name, description),
                 name: display_name,
                 path: path.clone(),
-                description,
                 nullable: is_nullable,
                 settings,
                 subcategories: Vec::new(),
@@ -368,7 +375,7 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
         } else {
             // This is a top-level setting: it goes on the page its
             // `x-category` names, or "General" when it names none.
-            let setting = parse_setting(&name, &path, &prop, &defs, &enum_values_map);
+            let setting = parse_setting(&name, &path, &path, &prop, &defs, &enum_values_map);
             let group = prop
                 .category
                 .clone()
@@ -387,9 +394,10 @@ pub fn parse_schema(schema_json: &str) -> Result<Vec<SettingCategory>, serde_jso
         sort_settings(&mut settings);
         let description = (group == GENERAL).then(|| "General settings".to_string());
         categories.push(SettingCategory {
+            display_name: i18n_category_name(&group),
+            description: i18n_category_description(&group, description),
             name: group,
             path: String::new(),
-            description,
             nullable: false,
             settings,
             subcategories: Vec::new(),
@@ -466,13 +474,15 @@ fn plugin_schema_to_category(
     let base_path = format!("/plugins/{}/settings", plugin_name);
 
     let properties = raw.properties.as_ref()?;
-    let settings = parse_properties(properties, &base_path, &defs, &enum_values_map);
+    let settings = parse_properties(properties, &base_path, &base_path, &defs, &enum_values_map);
     if settings.is_empty() {
         return None;
     }
 
+    // A plugin's page is named after the plugin, which is not translated.
     Some(SettingCategory {
         name: plugin_name.to_string(),
+        display_name: plugin_name.to_string(),
         path: base_path,
         description: raw.description.clone(),
         nullable: false,
@@ -503,10 +513,14 @@ fn build_enum_values_map(entries: &[EnumValueEntry]) -> EnumValuesMap {
     map
 }
 
-/// Parse properties into settings
+/// Parse properties into settings.
+///
+/// `parent_key_path` is the parent's path for translation keys; see
+/// [`parse_setting`].
 fn parse_properties(
     properties: &HashMap<String, RawSchema>,
     parent_path: &str,
+    parent_key_path: &str,
     defs: &HashMap<String, RawSchema>,
     enum_values_map: &EnumValuesMap,
 ) -> Vec<SettingSchema> {
@@ -514,7 +528,8 @@ fn parse_properties(
 
     for (name, prop) in properties {
         let path = format!("{}/{}", parent_path, name);
-        let setting = parse_setting(name, &path, prop, defs, enum_values_map);
+        let key_path = format!("{}/{}", parent_key_path, name);
+        let setting = parse_setting(name, &path, &key_path, prop, defs, enum_values_map);
 
         settings.push(setting);
     }
@@ -523,26 +538,35 @@ fn parse_properties(
     settings
 }
 
-/// Sort settings: by x-order (if set) first, then alphabetically by name.
-/// Settings with x-order come before those without.
+/// Sort settings: by x-order (if set) first, then alphabetically by path.
+/// Settings with x-order come before those without. The path, not the
+/// (possibly translated) name, keeps the order the same in every locale.
 fn sort_settings(settings: &mut [SettingSchema]) {
     settings.sort_by(|a, b| match (a.order, b.order) {
-        (Some(a_ord), Some(b_ord)) => a_ord.cmp(&b_ord).then_with(|| a.name.cmp(&b.name)),
+        (Some(a_ord), Some(b_ord)) => a_ord.cmp(&b_ord).then_with(|| a.path.cmp(&b.path)),
         (Some(_), None) => std::cmp::Ordering::Less,
         (None, Some(_)) => std::cmp::Ordering::Greater,
-        (None, None) => a.name.cmp(&b.name),
+        (None, None) => a.path.cmp(&b.path),
     });
 }
 
-/// Parse a single setting from its schema
+/// Parse a single setting from its schema.
+///
+/// `key_path` names the setting for translation keys. It is `path` for a
+/// setting at a fixed place in the config, but a nested object's fields are
+/// parsed with paths relative to the object (`/left`), so their key path
+/// keeps the full location (`/editor/status_bar/left`). Map values and array
+/// items stand for any key or index, spelled `*`
+/// (`/languages/*/grammar`).
 fn parse_setting(
     name: &str,
     path: &str,
+    key_path: &str,
     schema: &RawSchema,
     defs: &HashMap<String, RawSchema>,
     enum_values_map: &EnumValuesMap,
 ) -> SettingSchema {
-    let setting_type = determine_type(schema, defs, enum_values_map);
+    let setting_type = determine_type(schema, key_path, defs, enum_values_map);
 
     // Get description from resolved ref if not present on schema
     let resolved = resolve_ref(schema, defs);
@@ -550,11 +574,14 @@ fn parse_setting(
         .description
         .clone()
         .or_else(|| resolved.description.clone());
+    let description = i18n_description(key_path, description);
 
     // Check for readOnly flag on schema or resolved ref
     let read_only = schema.read_only || resolved.read_only;
 
-    // Get section from schema or resolved ref
+    // Get section from schema or resolved ref. It stays untranslated: pages
+    // group and order by it, and it is translated where it is shown
+    // ([`section_display_name`]).
     let section = schema.section.clone().or_else(|| resolved.section.clone());
 
     // Get order from schema or resolved ref
@@ -577,7 +604,7 @@ fn parse_setting(
 
     SettingSchema {
         path: path.to_string(),
-        name: i18n_name(path, name),
+        name: i18n_name(key_path, name),
         description,
         setting_type,
         default: schema.default.clone(),
@@ -599,9 +626,11 @@ fn parse_setting(
     }
 }
 
-/// Determine the SettingType from a schema
+/// Determine the SettingType from a schema. `key_path` is the setting's
+/// path for translation keys; see [`parse_setting`].
 fn determine_type(
     schema: &RawSchema,
+    key_path: &str,
     defs: &HashMap<String, RawSchema>,
     enum_values_map: &EnumValuesMap,
 ) -> SettingType {
@@ -693,8 +722,14 @@ fn determine_type(
                 // Check if items reference an object type
                 if items.ref_path.is_some() {
                     // Parse the item schema from the referenced definition
-                    let item_schema =
-                        parse_setting("item", "", item_resolved, defs, enum_values_map);
+                    let item_schema = parse_setting(
+                        "item",
+                        "",
+                        &format!("{}/*", key_path),
+                        item_resolved,
+                        defs,
+                        enum_values_map,
+                    );
 
                     // Only create ObjectArray if the item is an object with properties
                     if matches!(item_schema.setting_type, SettingType::Object { .. }) {
@@ -715,8 +750,14 @@ fn determine_type(
                 match add_props {
                     AdditionalProperties::Schema(schema_box) => {
                         let inner_resolved = resolve_ref(schema_box, defs);
-                        let value_schema =
-                            parse_setting("value", "", inner_resolved, defs, enum_values_map);
+                        let value_schema = parse_setting(
+                            "value",
+                            "",
+                            &format!("{}/*", key_path),
+                            inner_resolved,
+                            defs,
+                            enum_values_map,
+                        );
 
                         // Get display_field from x-display-field in the referenced schema.
                         // If the value schema is an array, also check the array items for display_field.
@@ -748,7 +789,7 @@ fn determine_type(
             }
             // Regular object with fixed properties
             if let Some(ref props) = resolved.properties {
-                let properties = parse_properties(props, "", defs, enum_values_map);
+                let properties = parse_properties(props, "", key_path, defs, enum_values_map);
                 return SettingType::Object { properties };
             }
             SettingType::Complex
@@ -787,19 +828,61 @@ fn resolve_ref<'a>(schema: &'a RawSchema, defs: &'a HashMap<String, RawSchema>) 
     schema
 }
 
+/// Translate `key` in the active locale, or `None` when no catalog has it.
+fn i18n_lookup(key: &str) -> Option<String> {
+    let translated = t!(key);
+    (*translated != *key).then(|| translated.to_string())
+}
+
+/// The translation key prefix for a settings field, derived from its schema
+/// path: `/editor/whitespace_show` becomes `settings.field.editor.whitespace_show`.
+fn field_key(path: &str) -> String {
+    format!("settings.field{}", path.replace('/', "."))
+}
+
 /// Look up an i18n translation for a settings field, falling back to humanized name.
 ///
-/// Derives a translation key from the schema path, e.g. `/editor/whitespace_show`
-/// becomes `settings.field.editor.whitespace_show`. If no translation is found,
-/// falls back to `humanize_name()`.
+/// The key is the field's [`field_key`]. If no translation is found, falls
+/// back to `humanize_name()`.
 fn i18n_name(path: &str, fallback_name: &str) -> String {
-    let key = format!("settings.field{}", path.replace('/', "."));
-    let translated = t!(&key);
-    if *translated == key {
-        humanize_name(fallback_name)
-    } else {
-        translated.to_string()
-    }
+    i18n_lookup(&field_key(path)).unwrap_or_else(|| humanize_name(fallback_name))
+}
+
+/// Look up an i18n translation for a settings field's description
+/// (`<field key>_desc`), falling back to the schema's own description.
+fn i18n_description(path: &str, fallback: Option<String>) -> Option<String> {
+    i18n_lookup(&format!("{}_desc", field_key(path))).or(fallback)
+}
+
+/// Turn a display label into a translation key segment:
+/// `"Syntax & Languages"` becomes `syntax_languages`.
+fn i18n_slug(label: &str) -> String {
+    label
+        .to_lowercase()
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Look up the display name of a category (`settings.category.<slug>`),
+/// falling back to its English name.
+fn i18n_category_name(name: &str) -> String {
+    i18n_lookup(&format!("settings.category.{}", i18n_slug(name)))
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// Look up a category's description (`settings.category.<slug>_desc`),
+/// falling back to the schema's own description.
+fn i18n_category_description(name: &str, fallback: Option<String>) -> Option<String> {
+    i18n_lookup(&format!("settings.category.{}_desc", i18n_slug(name))).or(fallback)
+}
+
+/// The display name of an `x-section` (`settings.section.<slug>`), falling
+/// back to the section as the schema names it.
+pub fn section_display_name(section: &str) -> String {
+    i18n_lookup(&format!("settings.section.{}", i18n_slug(section)))
+        .unwrap_or_else(|| section.to_string())
 }
 
 /// Convert snake_case to Title Case
@@ -1020,6 +1103,14 @@ mod tests {
         assert_eq!(humanize_name("line_numbers"), "Line Numbers");
         assert_eq!(humanize_name("check_for_updates"), "Check For Updates");
         assert_eq!(humanize_name("lsp"), "Lsp");
+    }
+
+    #[test]
+    fn test_i18n_slug() {
+        assert_eq!(i18n_slug("General"), "general");
+        assert_eq!(i18n_slug("File Explorer"), "file_explorer");
+        assert_eq!(i18n_slug("Syntax & Languages"), "syntax_languages");
+        assert_eq!(i18n_slug("LSP"), "lsp");
     }
 
     #[test]

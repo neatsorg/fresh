@@ -239,6 +239,8 @@ fn item(it: &Item) -> Node<UiMsg> {
         rows.push(rule());
     }
     if let Some(name) = &it.section {
+        // The section as the schema names it; its label is the locale's.
+        let name = crate::view::settings::schema::section_display_name(name);
         rows.push(
             text(format!("── {name} ──"))
                 .theme(attrs("editor.line_number_fg", "ui.popup_bg", &["bold"]))

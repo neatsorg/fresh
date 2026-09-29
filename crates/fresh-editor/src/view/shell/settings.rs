@@ -791,8 +791,9 @@ fn card(c: &Card) -> Node<UiMsg> {
         // "belongs to what is below" rather than to the card it follows. That
         // is what the painter's two-row `section_header_rows` band was.
         rows.push(row().h(Sizing::Cells(1)));
+        // The section as the schema names it; its label is the locale's.
         rows.push(line(
-            name.clone(),
+            crate::view::settings::schema::section_display_name(name),
             attrs("editor.fg", "ui.popup_bg", &["bold"]),
         ));
     }
